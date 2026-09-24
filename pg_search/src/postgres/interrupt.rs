@@ -111,7 +111,8 @@ pub(crate) fn cancel_pending() -> bool {
 }
 
 /// A scan that stopped early on a pending cancel/die under [`HeldInterrupts`], as opposed to
-/// one that ran out of rows. The hold's owner services the interrupt once `block_on` returns.
+/// one that ran out of rows. Returned as an error, or raised as a panic payload where the API
+/// has no error channel; the hold's owner services the interrupt once `block_on` returns.
 pub(crate) struct Interrupted;
 
 impl From<Interrupted> for DataFusionError {
@@ -156,7 +157,14 @@ pub(crate) fn block_on_next(
 ) -> Option<Result<RecordBatch, DataFusionError>> {
     let next = {
         let _held = HeldInterrupts::hold();
-        runtime.block_on(async { stream.next().await })
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async { stream.next().await })
+        }))
+    };
+    let next = match next {
+        Ok(next) => next,
+        Err(payload) if payload.is::<Interrupted>() => Some(Err(Interrupted.into())),
+        Err(payload) => std::panic::resume_unwind(payload),
     };
     check_for_interrupts();
     next

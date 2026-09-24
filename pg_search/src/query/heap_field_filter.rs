@@ -18,7 +18,7 @@
 use std::ptr::NonNull;
 
 use crate::postgres::heap::HeapFetchState;
-use crate::postgres::interrupt::stop_requested;
+use crate::postgres::interrupt::{Interrupted, stop_requested};
 use crate::postgres::rel::PgSearchRelation;
 use crate::query::PostgresPointer;
 use crate::query::tid_bitmap_stream::{BitmapCell, BitmapCursor};
@@ -563,13 +563,12 @@ impl DocSet for HeapFilterScorer {
     fn advance(&mut self) -> DocId {
         loop {
             // A predicate that rejects every doc keeps this loop in one call for a whole segment.
-            // The `TERMINATED` returned on a stop is not a real end: the scanner re-checks
-            // `stop_requested` before reporting rows or exhaustion.
-            let doc = if stop_requested() {
-                TERMINATED
-            } else {
-                self.indexed_scorer.advance()
-            };
+            // `DocSet` has no error channel, and returning `TERMINATED` would read as a real end,
+            // so a stop unwinds instead; the hold's owner catches `Interrupted`.
+            if stop_requested() {
+                std::panic::panic_any(Interrupted);
+            }
+            let doc = self.indexed_scorer.advance();
 
             if doc == TERMINATED {
                 self.current_doc = TERMINATED;

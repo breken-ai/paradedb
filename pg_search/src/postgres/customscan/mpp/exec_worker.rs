@@ -56,7 +56,7 @@ use crate::postgres::ParallelScanState;
 use crate::postgres::customscan::mpp::dispatch::fragments_for_worker;
 use crate::postgres::customscan::mpp::glue::producer_worker_cap;
 use crate::postgres::customscan::mpp::worker_fragments::FragmentRouting;
-use crate::postgres::interrupt::{HeldInterrupts, check_for_interrupts};
+use crate::postgres::interrupt::{HeldInterrupts, Interrupted, check_for_interrupts};
 use crate::postgres::utils::ExprContextGuard;
 use crate::scan::execution_plan::{
     pg_search_scan_desired_task_count, pg_search_scan_scale_up_leaf_node,
@@ -261,6 +261,7 @@ fn spawn_fragment_execution_task(
                     // them to a `DataFusionError::Execution`, and resume unwinding for everything else.
                     match fut.catch_unwind().await {
                         Ok(res) => res,
+                        Err(payload) if payload.is::<Interrupted>() => Err(Interrupted.into()),
                         Err(payload) => {
                             if let Some(msg) = downcast_pgrx_panic_payload(&*payload) {
                                 HeldInterrupts::reassert();

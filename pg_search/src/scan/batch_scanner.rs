@@ -736,12 +736,6 @@ impl Scanner {
             })
             .collect();
 
-        // A heap filter stops early on a pending cancel/die, whether it is in the scan's own
-        // query (the batch may miss rows) or in a JoinScan match-tag query (rows may miss their
-        // tag scores). An MPP worker would send such a batch on before servicing the stop.
-        if stop_requested() {
-            return Err(Interrupted);
-        }
         Ok(Some(Batch {
             num_rows: ids.len(),
             fields,
