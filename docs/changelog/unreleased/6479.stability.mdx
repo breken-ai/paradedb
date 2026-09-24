@@ -1,0 +1,5 @@
+---
+header: stability
+---
+
+Fixed a crash when a query using a parallel search scan was cancelled or timed out. A parallel worker handled the termination from inside the scan's async runtime and tore that runtime down mid-call, which could crash or hang the worker and make the server restart.
