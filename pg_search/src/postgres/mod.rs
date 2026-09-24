@@ -64,6 +64,7 @@ pub mod fake_aminsertcleanup;
 pub mod heap;
 pub mod index;
 pub(crate) mod index_only;
+pub(crate) mod interrupt;
 mod jsonb_support;
 pub mod locks;
 mod parallel;

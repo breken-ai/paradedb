@@ -55,8 +55,8 @@ use tokio_util::sync::CancellationToken;
 use crate::postgres::ParallelScanState;
 use crate::postgres::customscan::mpp::dispatch::fragments_for_worker;
 use crate::postgres::customscan::mpp::glue::producer_worker_cap;
-use crate::postgres::customscan::mpp::interrupt::{HeldInterrupts, check_for_interrupts};
 use crate::postgres::customscan::mpp::worker_fragments::FragmentRouting;
+use crate::postgres::interrupt::{HeldInterrupts, check_for_interrupts};
 use crate::postgres::utils::ExprContextGuard;
 use crate::scan::execution_plan::{
     pg_search_scan_desired_task_count, pg_search_scan_scale_up_leaf_node,
@@ -411,7 +411,7 @@ pub(crate) fn run_mpp_worker(
     let session_arc = Arc::new(session);
     // Hold cancel/die off for the duration so neither our drain/send loops nor a subroutine
     // (the scanner's own `CHECK_FOR_INTERRUPTS`, a buffer wait) can `proc_exit` out of the
-    // live runtime. The loops poll cooperatively to bail promptly; see `mpp::interrupt`.
+    // live runtime. The loops poll cooperatively to bail promptly; see `postgres::interrupt`.
     let held = HeldInterrupts::hold();
     let mesh_for_block = Arc::clone(worker_mesh);
     let outcome = runtime.block_on(async move {

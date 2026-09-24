@@ -30,7 +30,6 @@
 pub mod dispatch;
 pub mod exec_worker;
 pub mod glue;
-pub mod interrupt;
 pub mod launch;
 pub mod pg_seams;
 pub mod worker_fragments;

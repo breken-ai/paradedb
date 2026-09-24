@@ -20,6 +20,7 @@ use crate::index::fast_fields_helper::{
 };
 use crate::index::reader::index::MultiSegmentSearchResults;
 use crate::postgres::heap::VisibilityChecker;
+use crate::postgres::interrupt::{Interrupted, stop_requested};
 use arrow_array::builder::{BooleanBuilder, UInt64Builder};
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Float32Array, RecordBatch, RecordBatchOptions, UInt64Array,
@@ -256,6 +257,8 @@ impl ActiveTagScorer {
     }
 }
 
+type BatchIds = (SegmentOrdinal, Vec<Score>, Vec<DocId>);
+
 impl Scanner {
     /// Create a new scanner for the given search results.
     ///
@@ -384,11 +387,17 @@ impl Scanner {
         self.score_threshold = threshold;
     }
 
-    fn try_get_batch_ids(&mut self) -> Option<(SegmentOrdinal, Vec<Score>, Vec<DocId>)> {
+    fn try_get_batch_ids(&mut self) -> Result<Option<BatchIds>, Interrupted> {
         let can_pushdown = self.can_pushdown_score_threshold();
         // Collect a batch of ids for a single segment.
         loop {
-            let scorer_iter = self.search_results.current_segment()?;
+            // A selective query can walk many empty segments in one call.
+            if stop_requested() {
+                return Err(Interrupted);
+            }
+            let Some(scorer_iter) = self.search_results.current_segment() else {
+                return Ok(None);
+            };
             let segment_ord = scorer_iter.segment_ord();
             if can_pushdown && let Some(threshold) = self.score_threshold {
                 scorer_iter.set_threshold(threshold);
@@ -414,7 +423,7 @@ impl Scanner {
                 continue;
             }
 
-            return Some((segment_ord, scores, ids));
+            return Ok(Some((segment_ord, scores, ids)));
         }
     }
 
@@ -462,14 +471,18 @@ impl Scanner {
     /// materialization, allowing string-column filters (including dynamically
     /// generated lexicographical thresholds) to operate natively on cheap
     /// term ordinals rather than requiring expensive dictionary lookups.
+    ///
+    /// Returns `Ok(None)` when the scan is exhausted and `Err(Interrupted)` when a pending
+    /// cancel/die stopped it under `HeldInterrupts`.
     pub fn next(
         &mut self,
         ffhelper: &Arc<FFHelper>,
         visibility: &mut VisibilityChecker,
         pre_filters: Option<&crate::scan::pre_filter::PreFilters<'_>>,
-    ) -> Option<Batch> {
-        pgrx::check_for_interrupts!();
-        let (segment_ord, scores, mut ids) = self.try_get_batch_ids()?;
+    ) -> Result<Option<Batch>, Interrupted> {
+        let Some((segment_ord, scores, mut ids)) = self.try_get_batch_ids()? else {
+            return Ok(None);
+        };
         self.ensure_segment_tag_scorers(segment_ord);
 
         // Memoize fetched columns to avoid redundant fetches.
@@ -723,9 +736,15 @@ impl Scanner {
             })
             .collect();
 
-        Some(Batch {
+        // A heap filter stops early on a pending cancel/die, whether it is in the scan's own
+        // query (the batch may miss rows) or in a JoinScan match-tag query (rows may miss their
+        // tag scores). An MPP worker would send such a batch on before servicing the stop.
+        if stop_requested() {
+            return Err(Interrupted);
+        }
+        Ok(Some(Batch {
             num_rows: ids.len(),
             fields,
-        })
+        }))
     }
 }

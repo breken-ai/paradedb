@@ -33,13 +33,15 @@
 //!   so a `CHECK_FOR_INTERRUPTS()` anywhere under the runtime (the scanner's own check, a
 //!   buffer wait, our drain loops) can't `proc_exit` mid-flight. The hold covers the
 //!   subroutine checks our cooperative polling can't reach.
-//! - The drain/send loops still poll [`cancel_pending`] and bail with [`interrupted`] so a
+//! - The drain/send loops still poll [`cancel_pending`] and bail with [`Interrupted`] so a
 //!   pending cancel/die makes `block_on` return promptly instead of running the held query to
 //!   completion.
 //!
 //! `block_on` returns, the runtime goes idle, every fragment future (with its DSM senders)
 //! drops while the segment is still mapped, the hold resumes, and the caller calls
 //! [`check_for_interrupts`] to let PG act on the cancel/die with nothing left on the stack.
+
+use std::cell::Cell;
 
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::DataFusionError;
@@ -54,6 +56,12 @@ pub(crate) struct HeldInterrupts {
     _not_send: std::marker::PhantomData<*const ()>,
 }
 
+thread_local! {
+    /// Live [`HeldInterrupts`] guards on this backend. Kept apart from PG's
+    /// `InterruptHoldoffCount`, which PG also raises for its own sections and zeroes on ERROR.
+    static HELD_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
 impl HeldInterrupts {
     pub(crate) fn hold() -> Self {
         // SAFETY: backend-thread-only increment of the holdoff counter, paired with the
@@ -62,6 +70,7 @@ impl HeldInterrupts {
         unsafe {
             pgrx::pg_sys::InterruptHoldoffCount += 1;
         }
+        HELD_DEPTH.with(|depth| depth.set(depth.get() + 1));
         Self {
             _not_send: std::marker::PhantomData,
         }
@@ -91,6 +100,7 @@ impl Drop for HeldInterrupts {
             pgrx::pg_sys::InterruptHoldoffCount =
                 pgrx::pg_sys::InterruptHoldoffCount.saturating_sub(1);
         }
+        HELD_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
     }
 }
 
@@ -110,10 +120,16 @@ pub(crate) fn cancel_pending() -> bool {
     false
 }
 
-/// Error an MPP loop returns when it bails on a pending cancel/die. The dispatcher discards
-/// it and calls [`check_for_interrupts`] once `block_on` has returned.
-pub(crate) fn interrupted() -> DataFusionError {
-    DataFusionError::Execution("mpp: query interrupted".into())
+/// A scan that stopped early on a pending cancel/die under [`HeldInterrupts`], as opposed to
+/// one that ran out of rows. The hold's owner services the interrupt once `block_on` returns.
+pub(crate) struct Interrupted;
+
+impl From<Interrupted> for DataFusionError {
+    fn from(_: Interrupted) -> Self {
+        DataFusionError::Execution(
+            "search stopped because the query was canceled or its session is ending".into(),
+        )
+    }
 }
 
 /// Act on the cancel/die that [`HeldInterrupts`] held off and the drain loops bailed on
@@ -130,11 +146,20 @@ pub(crate) fn check_for_interrupts() {
 #[cfg(test)]
 pub(crate) fn check_for_interrupts() {}
 
-/// Drive one batch out of an MPP gather `stream` under the cancel/die holdoff, then service any
+/// Whether a loop should stop for a pending cancel/die. Outside a [`HeldInterrupts`] scope
+/// this runs `CHECK_FOR_INTERRUPTS`, which acts on the interrupt itself, and returns false.
+/// Inside one that check is a no-op, so it returns true and the hold's owner services the
+/// interrupt after `block_on` returns.
+pub(crate) fn stop_requested() -> bool {
+    check_for_interrupts();
+    HELD_DEPTH.with(|depth| depth.get() > 0) && cancel_pending()
+}
+
+/// Drive one batch out of a `stream` under the cancel/die holdoff, then service any
 /// interrupt the drain deferred. The holdoff wraps the synchronous `block_on`, not the async
 /// poll, so it can't move into the `Stream` itself: a `CHECK_FOR_INTERRUPTS` taken while
-/// `block_on` drives the runtime would `proc_exit` out of it. Shared by the JoinScan and
-/// AggregateScan consumers.
+/// `block_on` drives the runtime would `proc_exit` out of it. Shared by the JoinScan,
+/// AggregateScan, and columnar Base Scan consumers.
 pub(crate) fn block_on_next(
     runtime: &tokio::runtime::Runtime,
     stream: &mut SendableRecordBatchStream,
