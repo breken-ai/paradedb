@@ -15,11 +15,12 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-//! A cancel or `pg_terminate_backend` of a parallel columnar Base Scan's leader sends SIGTERM to
-//! its workers. A worker that handles it inside the tokio `block_on` driving its scan tears down
-//! the live runtime, and an assert-enabled server aborts and resets the cluster. This test
-//! signals a running scan from another connection and checks that a witness connection open
-//! throughout survives.
+//! A backend that acts on a die (`pg_terminate_backend`, or the SIGTERM a parallel query's leader
+//! sends its workers on cancel) in the middle of a Rust call runs exit cleanup without unwinding,
+//! and that cleanup used to drop scan state the call was still using: a tokio runtime inside
+//! `block_on`, a scorer still being built. The resulting panic became a second FATAL, and an
+//! assert-enabled server aborted and reset the cluster. This test signals running scans from
+//! another connection and checks that a witness connection open throughout survives.
 
 use anyhow::Result;
 use rstest::*;
@@ -28,14 +29,16 @@ use std::time::{Duration, Instant};
 use tests::fixtures::*;
 use tokio::time::sleep;
 
-// Many small segments and a selective query: each worker spends its time claiming segments that
-// have no matches, all inside one `block_on`, where a die lands.
+// Many small segments and selective queries, so a signal usually lands mid-scan.
 const SEGMENTS: usize = 100;
 
 const SETUP_SQL: &str = r#"
 CREATE EXTENSION IF NOT EXISTS pg_search CASCADE;
 CREATE TABLE bs_cancel (id bigserial primary key, body text, grp int, extra int);
 CREATE INDEX bs_cancel_idx ON bs_cancel USING bm25 (id, body, grp);
+-- A heap-filter predicate that checks for interrupts itself, like any function calling pg_sleep.
+CREATE FUNCTION bs_cancel_sleepy(x int) RETURNS bool LANGUAGE plpgsql IMMUTABLE AS
+$$ BEGIN PERFORM pg_sleep(0); RETURN x = -1; END $$;
 "#;
 
 const INSERT_SEGMENT: &str = r#"
@@ -52,18 +55,56 @@ SET parallel_tuple_cost TO 0;
 SET paradedb.min_rows_per_worker TO 0;
 "#;
 
-// Each query matches nothing, so every segment is walked: md5 bodies are hex, and `extra` is
-// never negative. `extra` is not indexed, so the second is evaluated per doc as a heap filter.
-const QUERIES: [(&str, &str, &str); 2] = [
+// A serial Base Scan, which runs no tokio runtime.
+const SERIAL_GUCS: &str = r#"
+SET max_parallel_workers_per_gather TO 0;
+SET paradedb.enable_aggregate_custom_scan TO off;
+"#;
+
+// (name, session settings, query, EXPLAIN must contain). Each query matches nothing, so every
+// segment is walked: md5 bodies are hex, and `extra` is never negative. `extra` is not indexed,
+// so it is evaluated per doc as a heap filter. In the last case the heap filter's own
+// `pg_sleep` acts on the die while the scorer is still being built.
+const QUERIES: [(&str, &str, &str, &[&str]); 4] = [
     (
         "regex",
+        PARALLEL_GUCS,
         "SELECT grp FROM bs_cancel WHERE id @@@ paradedb.regex('body', '.*q.*z.*') AND grp = 1",
-        "regex",
+        &[
+            "Parallel Custom Scan (ParadeDB Base Scan)",
+            "ColumnarExecState",
+            "regex",
+        ],
     ),
     (
         "heapfilter",
+        PARALLEL_GUCS,
         "SELECT grp FROM bs_cancel WHERE id @@@ paradedb.all() AND extra = -1",
-        "heap_filter",
+        &[
+            "Parallel Custom Scan (ParadeDB Base Scan)",
+            "ColumnarExecState",
+            "heap_filter",
+        ],
+    ),
+    (
+        "serial_heapfilter",
+        SERIAL_GUCS,
+        "SELECT count(*) FROM bs_cancel WHERE id @@@ paradedb.all() AND extra = -1",
+        &[
+            "Custom Scan (ParadeDB Base Scan)",
+            "NormalScanExecState",
+            "heap_filter",
+        ],
+    ),
+    (
+        "serial_heapfilter_sleep",
+        SERIAL_GUCS,
+        "SELECT count(*) FROM bs_cancel WHERE id @@@ paradedb.all() AND bs_cancel_sleepy(extra)",
+        &[
+            "Custom Scan (ParadeDB Base Scan)",
+            "NormalScanExecState",
+            "heap_filter",
+        ],
     ),
 ];
 
@@ -76,12 +117,13 @@ const TARGET_LOOP_TIMEOUT: Duration = Duration::from_secs(30);
 const QUERY_CANCELED: &str = "57014";
 const ADMIN_SHUTDOWN: &str = "57P01";
 
-async fn assert_query_plans_as_parallel_columnar(
+async fn assert_plan(
     conn: &mut PgConnection,
+    gucs: &'static str,
     query: &str,
-    tantivy_query_contains: &str,
+    plan_contains: &[&str],
 ) -> Result<()> {
-    conn.execute(PARALLEL_GUCS).await?;
+    conn.execute(gucs).await?;
     let rows: Vec<(String,)> = sqlx::query_as(AssertSqlSafe(format!(
         "EXPLAIN (COSTS OFF, VERBOSE) {query}"
     )))
@@ -92,12 +134,12 @@ async fn assert_query_plans_as_parallel_columnar(
         .map(|(line,)| line)
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(
-        explain.contains("Parallel Custom Scan (ParadeDB Base Scan)")
-            && explain.contains("ColumnarExecState")
-            && explain.contains(tantivy_query_contains),
-        "Base Scan cancel test query must plan as a parallel columnar Base Scan:\n{explain}"
-    );
+    for needle in plan_contains {
+        assert!(
+            explain.contains(needle),
+            "Base Scan cancel test query must plan with `{needle}`:\n{explain}"
+        );
+    }
     Ok(())
 }
 
@@ -148,6 +190,7 @@ async fn signal_until_stopped(
 async fn run_until_signalled(
     mut target: PgConnection,
     app_name: String,
+    gucs: &'static str,
     query: &'static str,
     expected: &'static str,
 ) -> Result<()> {
@@ -156,7 +199,7 @@ async fn run_until_signalled(
             "SET application_name = '{app_name}';"
         )))
         .await?;
-    target.execute(PARALLEL_GUCS).await?;
+    target.execute(gucs).await?;
 
     let err = loop {
         if let Err(e) = target.execute(query).await {
@@ -202,11 +245,11 @@ async fn basescan_signal_does_not_crash_workers(database: Db) -> Result<()> {
 
     let mut witness = database.connection().await;
     assert_cluster_alive(&mut witness).await?;
-    for (_, query, tantivy_query_contains) in QUERIES {
-        assert_query_plans_as_parallel_columnar(&mut setup, query, tantivy_query_contains).await?;
+    for (_, gucs, query, plan_contains) in QUERIES {
+        assert_plan(&mut setup, gucs, query, plan_contains).await?;
     }
 
-    for (name, query, _) in QUERIES {
+    for (name, gucs, query, _) in QUERIES {
         for (signal, signal_fn, expected) in [
             ("cancel", "pg_cancel_backend", QUERY_CANCELED),
             ("terminate", "pg_terminate_backend", ADMIN_SHUTDOWN),
@@ -217,6 +260,7 @@ async fn basescan_signal_does_not_crash_workers(database: Db) -> Result<()> {
                 let loop_handle = tokio::spawn(run_until_signalled(
                     target,
                     app_name.clone(),
+                    gucs,
                     query,
                     expected,
                 ));

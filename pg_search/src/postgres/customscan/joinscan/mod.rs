@@ -180,10 +180,10 @@ use crate::postgres::customscan::limit_offset::LimitOffset;
 use crate::postgres::customscan::mpp::glue::{
     query_allows_parallel_mode, record_worker_spill, warn_if_spilled,
 };
+use crate::postgres::customscan::mpp::interrupt::block_on_next;
 use crate::postgres::customscan::mpp::launch::MppLifecycle;
 use crate::postgres::customscan::mpp::launch::mpp_eligible;
 use crate::postgres::customscan::mpp::worker_fragments::mpp_plan_has_data_parallelism;
-use crate::postgres::interrupt::block_on_next;
 use arrow_array::Array;
 use datafusion_distributed::shm::MppMesh;
 

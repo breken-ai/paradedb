@@ -20,6 +20,7 @@ use std::sync::Arc;
 use arrow_array::{Array, RecordBatch};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::ExecutionPlan;
+use futures::StreamExt;
 use tokio::runtime::Runtime;
 
 use crate::api::HashMap;
@@ -29,12 +30,31 @@ use crate::postgres::customscan::basescan::exec_methods::{ExecMethod, ExecState}
 use crate::postgres::customscan::basescan::scan_state::BaseScanState;
 use crate::postgres::customscan::builders::custom_path::ExecMethodType;
 use crate::postgres::heap::VisibilityChecker;
-use crate::postgres::interrupt::block_on_next;
 use crate::postgres::rel::PgSearchRelation;
 use crate::postgres::types_arrow::arrow_array_to_datum;
 use crate::scan::execution_plan::{PgSearchScanPlan, ScanState};
 
 use pgrx::{IntoDatum, PgOid, PgTupleDesc, pg_sys};
+
+// ============================================================================
+// Synchronous stream polling utilities
+// ============================================================================
+
+/// Polls a stream for the next item synchronously using a tokio runtime.
+/// This properly handles `Poll::Pending` by driving the stream to completion,
+/// which is necessary for DataFusion operators that may buffer data across polls.
+///
+/// Uses the same tokio runtime pattern as JoinScan for consistency.
+fn poll_next_sync<S: futures::Stream + Unpin>(
+    runtime: &Runtime,
+    stream: &mut S,
+) -> Option<S::Item> {
+    // Check for query cancellation before blocking
+    pgrx::check_for_interrupts!();
+
+    // Use tokio runtime to drive the stream (same pattern as JoinScan)
+    runtime.block_on(async { stream.next().await })
+}
 
 struct Inner {
     heaprel: Option<PgSearchRelation>,
@@ -443,7 +463,7 @@ impl ExecMethod for ColumnarExecState {
             // Scope the runtime borrow to avoid conflicts with mutable borrows below
             if let Some(stream) = &mut self.stream {
                 let runtime = self.runtime.as_ref().unwrap();
-                match block_on_next(runtime, stream) {
+                match poll_next_sync(runtime, stream) {
                     Some(Ok(batch)) => {
                         self.current_record_batch = Some(batch);
                         self.current_batch_row_idx = 0;

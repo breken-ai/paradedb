@@ -16,6 +16,7 @@
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 use crate::postgres::customscan::CustomScan;
+use crate::postgres::utils::DropUnlessExiting;
 use pgrx::{PgList, PgMemoryContexts, pg_sys};
 use std::fmt::{Debug, Formatter};
 use std::ptr::addr_of_mut;
@@ -113,24 +114,26 @@ impl<CS: CustomScan, P: From<*mut pg_sys::List>> CustomScanStateBuilder<CS, P> {
 
     pub fn build(self) -> *mut CustomScanStateWrapper<CS> {
         let flags = unsafe { (*self.args.cscan).flags };
-        PgMemoryContexts::CurrentMemoryContext.leak_and_drop_on_delete(CustomScanStateWrapper {
-            csstate: pg_sys::CustomScanState {
-                ss: pg_sys::ScanState {
-                    ps: pg_sys::PlanState {
-                        type_: pg_sys::NodeTag::T_CustomScanState,
+        PgMemoryContexts::CurrentMemoryContext
+            .leak_and_drop_on_delete(DropUnlessExiting::new(CustomScanStateWrapper::<CS> {
+                csstate: pg_sys::CustomScanState {
+                    ss: pg_sys::ScanState {
+                        ps: pg_sys::PlanState {
+                            type_: pg_sys::NodeTag::T_CustomScanState,
+                            ..Default::default()
+                        },
                         ..Default::default()
                     },
-                    ..Default::default()
+                    flags,
+                    custom_ps: std::ptr::null_mut(),
+                    pscan_len: 0,
+                    methods: CS::custom_exec_methods(),
+                    #[cfg(any(feature = "pg16", feature = "pg17", feature = "pg18"))]
+                    slotOps: std::ptr::null_mut(),
                 },
-                flags,
-                custom_ps: std::ptr::null_mut(),
-                pscan_len: 0,
-                methods: CS::custom_exec_methods(),
-                #[cfg(any(feature = "pg16", feature = "pg17", feature = "pg18"))]
-                slotOps: std::ptr::null_mut(),
-            },
-            custom_state: self.custom_state,
-            runtime_context: std::ptr::null_mut(),
-        })
+                custom_state: self.custom_state,
+                runtime_context: std::ptr::null_mut(),
+            }))
+            .cast()
     }
 }

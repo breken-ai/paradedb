@@ -85,6 +85,43 @@ macro_rules! impl_safe_drop {
     };
 }
 
+/// Owns a value that pgrx drops when its memory context is deleted, except once `proc_exit` is
+/// in progress. A FATAL runs exit cleanup without unwinding the stack, so the value may still be
+/// in use by a Rust call that never returned (a runtime inside `block_on`, a scorer still being
+/// built), and dropping it there panics. Postgres itself releases what such a value holds outside
+/// the process (buffer pins, locks, temp files, DSM/DSA attachments), and the process is about
+/// to end, so it is leaked instead. `repr(transparent)` keeps a pointer to it usable as a pointer
+/// to the value, which custom-scan states rely on.
+#[repr(transparent)]
+pub(crate) struct DropUnlessExiting<T>(std::mem::ManuallyDrop<T>);
+
+impl<T> DropUnlessExiting<T> {
+    pub(crate) fn new(value: T) -> Self {
+        Self(std::mem::ManuallyDrop::new(value))
+    }
+}
+
+impl<T> Drop for DropUnlessExiting<T> {
+    fn drop(&mut self) {
+        if exiting() {
+            return;
+        }
+        // SAFETY: the value is dropped exactly once, here.
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.0) }
+    }
+}
+
+#[cfg(not(test))]
+fn exiting() -> bool {
+    // SAFETY: plain read of a backend-local flag on the backend thread.
+    unsafe { pgrx::pg_sys::proc_exit_inprogress }
+}
+
+#[cfg(test)]
+fn exiting() -> bool {
+    false
+}
+
 /// RAII guard for PostgreSQL standalone expression context
 /// Automatically frees the context when dropped
 ///

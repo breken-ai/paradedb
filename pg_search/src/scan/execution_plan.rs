@@ -1379,7 +1379,7 @@ impl ExecutionPlan for PgSearchScanPlan {
                     }
                 }
 
-                match next_batch? {
+                match next_batch {
                     Some(batch) => {
                         let record_batch = batch.to_record_batch(&schema);
                         yield record_batch.record_output(&baseline_metrics);

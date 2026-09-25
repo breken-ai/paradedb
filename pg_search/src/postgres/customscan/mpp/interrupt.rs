@@ -33,7 +33,7 @@
 //!   so a `CHECK_FOR_INTERRUPTS()` anywhere under the runtime (the scanner's own check, a
 //!   buffer wait, our drain loops) can't `proc_exit` mid-flight. The hold covers the
 //!   subroutine checks our cooperative polling can't reach.
-//! - The drain/send loops still poll [`cancel_pending`] and bail with [`Interrupted`] so a
+//! - The drain/send loops still poll [`cancel_pending`] and bail with [`interrupted`] so a
 //!   pending cancel/die makes `block_on` return promptly instead of running the held query to
 //!   completion.
 //!
@@ -110,17 +110,10 @@ pub(crate) fn cancel_pending() -> bool {
     false
 }
 
-/// A scan that stopped early on a pending cancel/die under [`HeldInterrupts`], as opposed to
-/// one that ran out of rows. Returned as an error, or raised as a panic payload where the API
-/// has no error channel; the hold's owner services the interrupt once `block_on` returns.
-pub(crate) struct Interrupted;
-
-impl From<Interrupted> for DataFusionError {
-    fn from(_: Interrupted) -> Self {
-        DataFusionError::Execution(
-            "search stopped because the query was canceled or its session is ending".into(),
-        )
-    }
+/// Error an MPP loop returns when it bails on a pending cancel/die. The dispatcher discards
+/// it and calls [`check_for_interrupts`] once `block_on` has returned.
+pub(crate) fn interrupted() -> DataFusionError {
+    DataFusionError::Execution("mpp: query interrupted".into())
 }
 
 /// Act on the cancel/die that [`HeldInterrupts`] held off and the drain loops bailed on
@@ -137,34 +130,18 @@ pub(crate) fn check_for_interrupts() {
 #[cfg(test)]
 pub(crate) fn check_for_interrupts() {}
 
-/// Whether a loop should stop for a pending cancel/die. This runs `CHECK_FOR_INTERRUPTS`
-/// first, which acts on the interrupt itself when interrupts aren't held. Under
-/// [`HeldInterrupts`] that check is a no-op, so the pending cancel/die is reported instead and
-/// the hold's owner services it after `block_on` returns.
-pub(crate) fn stop_requested() -> bool {
-    check_for_interrupts();
-    cancel_pending()
-}
-
-/// Drive one batch out of a `stream` under the cancel/die holdoff, then service any
+/// Drive one batch out of an MPP gather `stream` under the cancel/die holdoff, then service any
 /// interrupt the drain deferred. The holdoff wraps the synchronous `block_on`, not the async
 /// poll, so it can't move into the `Stream` itself: a `CHECK_FOR_INTERRUPTS` taken while
-/// `block_on` drives the runtime would `proc_exit` out of it. Shared by the JoinScan,
-/// AggregateScan, and columnar Base Scan consumers.
+/// `block_on` drives the runtime would `proc_exit` out of it. Shared by the JoinScan and
+/// AggregateScan consumers.
 pub(crate) fn block_on_next(
     runtime: &tokio::runtime::Runtime,
     stream: &mut SendableRecordBatchStream,
 ) -> Option<Result<RecordBatch, DataFusionError>> {
     let next = {
         let _held = HeldInterrupts::hold();
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            runtime.block_on(async { stream.next().await })
-        }))
-    };
-    let next = match next {
-        Ok(next) => next,
-        Err(payload) if payload.is::<Interrupted>() => Some(Err(Interrupted.into())),
-        Err(payload) => std::panic::resume_unwind(payload),
+        runtime.block_on(async { stream.next().await })
     };
     check_for_interrupts();
     next
