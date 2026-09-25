@@ -166,7 +166,25 @@ mod block_tracker {
         };
     }
 
+    /// `forget!` for a buffer being dropped. Once the transaction has aborted, its resource
+    /// owner has already released every buffer pin, so the block number can't be asked for and
+    /// nothing is tracked any more.
+    macro_rules! forget_buffer {
+        ($pg_buffer:expr) => {
+            let map = block_tracker::BLOCK_TRACKER.get_or_init(|| Default::default());
+            let mut lock = map.lock();
+            if crate::postgres::utils::IsTransactionState() {
+                lock.remove(&block_tracker::TrackedBlock::Drop(
+                    pg_sys::BufferGetBlockNumber($pg_buffer),
+                ));
+            } else {
+                lock.clear();
+            }
+        };
+    }
+
     pub(super) use forget;
+    pub(super) use forget_buffer;
     pub(super) use track;
 }
 
@@ -183,7 +201,12 @@ mod block_tracker {
         ($blockno:expr) => {};
     }
 
+    macro_rules! forget_buffer {
+        ($pg_buffer:expr) => {};
+    }
+
     pub(super) use forget;
+    pub(super) use forget_buffer;
     pub(super) use track;
 }
 
@@ -200,7 +223,7 @@ impl Drop for Buffer {
         unsafe {
             if self.pg_buffer != pg_sys::InvalidBuffer as pg_sys::Buffer {
                 // block_tracker bookkeeping must run unconditionally
-                block_tracker::forget!(pg_sys::BufferGetBlockNumber(self.pg_buffer));
+                block_tracker::forget_buffer!(self.pg_buffer);
 
                 // Skip PostgreSQL cleanup during panic unwinding to prevent double-panics.
                 // InterruptHoldoffCount check is a PostgreSQL-level indicator of error handling.
@@ -436,7 +459,7 @@ impl Drop for PinnedBuffer {
     fn drop(&mut self) {
         unsafe {
             // block_tracker bookkeeping must run unconditionally
-            block_tracker::forget!(pg_sys::BufferGetBlockNumber(self.pg_buffer));
+            block_tracker::forget_buffer!(self.pg_buffer);
 
             // Skip PostgreSQL cleanup during panic unwinding to prevent double-panics
             if crate::postgres::utils::IsTransactionState() && !std::thread::panicking() {
