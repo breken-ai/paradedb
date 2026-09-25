@@ -314,25 +314,27 @@ impl SearchTokenizerFilters {
 
 macro_rules! add_filters {
     ($tokenizer:expr, $filters:expr $(, $extra_filter:expr )* $(,)?) => {{
-        // Build the analyzer with static filters first
+        // Stopwords are matched against the lowercased word, so they run before
+        // stemming and folding change it (e.g. French "avons" stems to "avon").
         let mut builder = tantivy::tokenizer::TextAnalyzer::builder($tokenizer)
             .filter($filters.token_length_filter())
             .filter($filters.trim_filter())
             .filter($filters.lower_caser())
-            .filter($filters.stemmer())
             .filter($filters.stopwords())
-            .filter($filters.ascii_folding())
-            $(
-                .filter($extra_filter)
-            )*
-            .filter($filters.alpha_num_only())
             // Convert to type-erased builder for dynamic filter application
             .dynamic();
         // Apply stopword language filters dynamically in a for loop
         for stopword_filter in $filters.stopwords_languages() {
             builder = builder.filter_dynamic(stopword_filter);
         }
-        builder.build()
+        builder
+            .filter($filters.stemmer())
+            .filter($filters.ascii_folding())
+            $(
+                .filter($extra_filter)
+            )*
+            .filter($filters.alpha_num_only())
+            .build()
     }};
 }
 
@@ -1036,6 +1038,48 @@ mod tests {
         assert_eq!(
             tokenizer,
             SearchTokenizer::from_json_value(&serde_json::from_str(json).unwrap()).unwrap()
+        );
+    }
+
+    #[rstest]
+    fn test_stopwords_are_removed_before_stemming_and_folding() {
+        use tantivy::tokenizer::TokenStream;
+
+        fn tokens(json: &str, text: &str) -> Vec<String> {
+            let tokenizer =
+                SearchTokenizer::from_json_value(&serde_json::from_str(json).unwrap()).unwrap();
+            let mut analyzer = tokenizer.to_tantivy_tokenizer().unwrap();
+            let mut stream = analyzer.token_stream(text);
+            let mut out = vec![];
+            while stream.advance() {
+                out.push(stream.token().text.clone());
+            }
+            out
+        }
+
+        // "avons" is a French stopword, but its stem "avon" is not.
+        assert_eq!(
+            tokens(
+                r#"{"type": "default", "stemmer": "French", "stopwords_language": "French"}"#,
+                "nous avons mangé des pommes"
+            ),
+            vec!["mang", "pomm"]
+        );
+        // The same holds for a custom stopword list.
+        assert_eq!(
+            tokens(
+                r#"{"type": "default", "stemmer": "English", "stopwords": ["running"]}"#,
+                "running home"
+            ),
+            vec!["home"]
+        );
+        // "für" is a German stopword, but its folded form "fur" is not.
+        assert_eq!(
+            tokens(
+                r#"{"type": "default", "ascii_folding": true, "stopwords_language": "German"}"#,
+                "äpfel für kinder"
+            ),
+            vec!["apfel", "kinder"]
         );
     }
 
