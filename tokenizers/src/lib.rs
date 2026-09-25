@@ -52,6 +52,9 @@ pub fn register_tokenizers_into(
                 tokenizer_name = &search_tokenizer.name(),
                 "registering tokenizer",
             );
+            if let Some(legacy_name) = search_tokenizer.legacy_name() {
+                tokenizer_manager.register(&legacy_name, text_analyzer.clone());
+            }
             tokenizer_manager.register(&search_tokenizer.name(), text_analyzer);
         }
     }

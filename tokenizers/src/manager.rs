@@ -803,6 +803,19 @@ pub static LANGUAGES: Lazy<HashMap<Language, &str>> = Lazy::new(|| {
 });
 
 impl SearchTokenizer {
+    /// The name an older version registered this tokenizer under, when it differs from
+    /// [`Self::name`]. Indexes built by that version still refer to it.
+    pub(crate) fn legacy_name(&self) -> Option<String> {
+        match self {
+            // Before the pattern was part of the name, every regex tokenizer with the same
+            // filters shared this name.
+            SearchTokenizer::RegexTokenizer { filters, .. } => {
+                Some(format!("regex{}", filters.name_suffix()))
+            }
+            _ => None,
+        }
+    }
+
     pub fn name(&self) -> String {
         let filters_suffix = self.filters().name_suffix();
         match self {
@@ -816,7 +829,11 @@ impl SearchTokenizer {
                 format!("literal_normalized{filters_suffix}")
             }
             SearchTokenizer::WhiteSpace(_filters) => format!("whitespace{filters_suffix}"),
-            SearchTokenizer::RegexTokenizer { .. } => format!("regex{filters_suffix}"),
+            // The pattern is part of the name so that fields with different patterns get
+            // their own analyzer. It is Debug-quoted so it cannot run into the filter suffix.
+            SearchTokenizer::RegexTokenizer { pattern, .. } => {
+                format!("regex_pattern:{pattern:?}{filters_suffix}")
+            }
             SearchTokenizer::ChineseCompatible(_filters) => {
                 format!("chinese_compatible{filters_suffix}")
             }
@@ -1037,6 +1054,38 @@ mod tests {
             tokenizer,
             SearchTokenizer::from_json_value(&serde_json::from_str(json).unwrap()).unwrap()
         );
+    }
+
+    #[rstest]
+    fn test_regex_tokenizers_with_different_patterns_do_not_share_an_analyzer() {
+        use tantivy::tokenizer::TokenStream;
+
+        let digits = SearchTokenizer::RegexTokenizer {
+            pattern: "[0-9]+".to_string(),
+            filters: SearchTokenizerFilters::default(),
+        };
+        let letters = SearchTokenizer::RegexTokenizer {
+            pattern: "[a-z]+".to_string(),
+            filters: SearchTokenizerFilters::default(),
+        };
+        assert_ne!(digits.name(), letters.name());
+
+        // Two fields of one index, each with its own pattern, register into one manager.
+        let manager = crate::create_tokenizer_manager(vec![digits.clone(), letters.clone()]);
+        let tokens = |tokenizer: &SearchTokenizer, text: &str| {
+            let mut analyzer = manager.get(&tokenizer.name()).unwrap();
+            let mut stream = analyzer.token_stream(text);
+            let mut out = vec![];
+            while stream.advance() {
+                out.push(stream.token().text.clone());
+            }
+            out
+        };
+        assert_eq!(tokens(&digits, "abc 123 def 456"), vec!["123", "456"]);
+        assert_eq!(tokens(&letters, "abc 123 def 456"), vec!["abc", "def"]);
+
+        // Indexes built before the pattern was part of the name still refer to `regex`.
+        assert!(manager.get("regex").is_some());
     }
 
     #[rstest]
