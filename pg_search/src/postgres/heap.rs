@@ -34,9 +34,7 @@ use crate::schema::{CategorizedFieldData, FieldSource, SearchField};
 use parking_lot::Mutex;
 use pgrx::pg_sys;
 use pgrx::{PgList, PgTupleDesc, check_for_interrupts};
-use tantivy::SegmentReader;
 use tantivy::columnar::Cardinality;
-use tantivy::index::SegmentId;
 use tantivy::{DocId, SegmentOrdinal, TantivyDocument};
 
 use util::HEAPBLOCKS_PER_BYTE;
@@ -129,7 +127,8 @@ pub struct VisibilityChecker {
     // TODO: Make this non-optional in the future once all call sites provide an FFHelper.
     ffhelper: Option<Arc<FFHelper>>,
     raw_ctids_scratch: Vec<Option<u64>>,
-    segment_visibility: Option<(SegmentId, bool)>,
+    /// Caches whether each segment has been proven all-visible under this checker's snapshot.
+    segment_visibility: HashMap<SegmentOrdinal, bool>,
     segment_checks: HashMap<SegmentOrdinal, Option<Arc<[Range<DocId>]>>>,
 }
 
@@ -178,7 +177,7 @@ impl VisibilityChecker {
                 check_visibility: true,
                 ffhelper: None,
                 raw_ctids_scratch: Vec::new(),
-                segment_visibility: None,
+                segment_visibility: HashMap::default(),
                 segment_checks: HashMap::default(),
             }
         }
@@ -187,15 +186,15 @@ impl VisibilityChecker {
     /// Attaches an [`FFHelper`] for resolving segment `DocId`s to ctids directly.
     pub fn with_ffhelper(mut self, ffhelper: Arc<FFHelper>) -> Self {
         self.segment_checks.clear();
+        self.segment_visibility.clear();
         self.ffhelper = Some(ffhelper);
-        self.segment_visibility = None;
         self
     }
 
     pub fn set_ffhelper(&mut self, ffhelper: Arc<FFHelper>) {
         self.segment_checks.clear();
+        self.segment_visibility.clear();
         self.ffhelper = Some(ffhelper);
-        self.segment_visibility = None;
     }
 
     pub fn ffhelper(&self) -> Option<&Arc<FFHelper>> {
@@ -323,33 +322,65 @@ impl VisibilityChecker {
         self.blockvis.1
     }
 
+    /// Returns `Some(self)` if the segment requires visibility checking, or `None` if the segment
+    /// is proven all-visible under this checker's snapshot.
+    ///
+    /// Callers can use this to bypass buffering, visibility filtering, and compaction for all-visible
+    /// segments, and avoid reading CTIDs unless explicitly required.
     pub(crate) fn for_segment(
-        checker: &Arc<Mutex<Self>>,
-        segment: &SegmentReader,
-    ) -> tantivy::Result<Option<Arc<Mutex<Self>>>> {
-        Ok((!checker.lock().is_segment_all_visible(segment)?).then(|| checker.clone()))
+        &mut self,
+        segment_ord: SegmentOrdinal,
+    ) -> tantivy::Result<Option<&mut Self>> {
+        Ok((!self.is_segment_all_visible(segment_ord)?).then_some(self))
     }
 
+    /// Convenience helper for callers holding an `Arc<Mutex<VisibilityChecker>>`.
+    ///
+    /// Returns `Some(checker.clone())` if the segment requires visibility checking, or `None` if
+    /// the segment is proven all-visible.
+    pub(crate) fn for_segment_arc(
+        checker: &Arc<Mutex<Self>>,
+        segment_ord: SegmentOrdinal,
+    ) -> tantivy::Result<Option<Arc<Mutex<Self>>>> {
+        Ok((!checker.lock().is_segment_all_visible(segment_ord)?).then(|| checker.clone()))
+    }
+
+    /// Checks whether all documents in the segment are guaranteed to be visible under this checker's snapshot.
+    ///
+    /// The proof requires an MVCC snapshot, an immutable segment with non-zero documents, and either:
+    /// 1. An empty set of missing ranges from heap-block presence maps, or
+    /// 2. Fully populated CTID fast fields whose heap-block range spans <= 64 VM pages and is
+    ///    confirmed all-visible in Postgres's visibility map.
+    ///
+    /// Results are cached per segment in `self.segment_visibility`.
     pub(crate) fn is_segment_all_visible(
         &mut self,
-        segment: &SegmentReader,
+        segment_ord: SegmentOrdinal,
     ) -> tantivy::Result<bool> {
-        if let Some((id, visible)) = self.segment_visibility
-            && id == segment.segment_id()
-        {
+        if let Some(&visible) = self.segment_visibility.get(&segment_ord) {
             return Ok(visible);
         }
+        let Some(ffhelper) = self.ffhelper.clone() else {
+            return Ok(false);
+        };
+        let Some(segment) = ffhelper.immutable_segment_reader(segment_ord) else {
+            return Ok(false);
+        };
         // prove segment is all visible
         let visible = 'proof: {
             if self.snapshot.is_null()
                 || unsafe { (*self.snapshot).snapshot_type != pg_sys::SnapshotType::SNAPSHOT_MVCC }
-                || !self
-                    .ffhelper
-                    .as_ref()
-                    .is_some_and(|helper| helper.is_immutable_segment(segment.segment_id()))
                 || segment.num_docs() == 0
             {
                 break 'proof false;
+            }
+            if self
+                .segment_checks
+                .get(&segment_ord)
+                .and_then(|ranges| ranges.as_ref())
+                .is_some_and(|ranges| ranges.is_empty())
+            {
+                break 'proof true;
             }
             let ctids = segment.fast_fields().u64(CTID_FIELD_NAME)?;
             if ctids.get_cardinality() != Cardinality::Full || ctids.num_docs() != segment.max_doc()
@@ -369,7 +400,12 @@ impl VisibilityChecker {
             // Read CTID bounds before fresh VM bits; FFHelper retains the VACUUM cleanup pin.
             self.is_range_all_visible(first, last)
         };
-        self.segment_visibility = Some((segment.segment_id(), visible));
+        if visible {
+            self.segment_checks
+                .entry(segment_ord)
+                .or_insert_with(|| Some(Arc::from([])));
+        }
+        self.segment_visibility.insert(segment_ord, visible);
         Ok(visible)
     }
 
