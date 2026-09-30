@@ -106,7 +106,7 @@ fn tokenizer_from_name(name: &str) -> Option<SearchTokenizer> {
         "edge_ngram" => SearchTokenizer::EdgeNgram {
             min_gram: 0,
             max_gram: 0,
-            token_chars: vec![],
+            token_chars: vec!["letter".to_string(), "digit".to_string()],
             filters: SearchTokenizerFilters::default(),
         },
         "whitespace" => SearchTokenizer::WhiteSpace(SearchTokenizerFilters::default()),
@@ -148,13 +148,35 @@ pub(crate) fn tokenizer_from_expression(expr: &str) -> Option<SearchTokenizer> {
 
 fn parse_tokenizer_params(inner: &str) -> typmod::ParsedTypmod {
     let mut parsed = typmod::ParsedTypmod::new();
-    for part in inner.split(',') {
+    let parts = inner.split(',').collect::<Vec<_>>();
+    let mut index = 0;
+    while index < parts.len() {
+        let part = parts[index].trim();
+        if let Some(token_chars) = part.strip_prefix("token_chars=") {
+            let mut value = token_chars.to_string();
+            index += 1;
+            while index < parts.len()
+                && matches!(
+                    parts[index].trim().to_ascii_lowercase().as_str(),
+                    "letter" | "digit" | "whitespace" | "punctuation" | "symbol"
+                )
+            {
+                value.push(',');
+                value.push_str(parts[index].trim());
+                index += 1;
+            }
+            if let Ok(property) = format!("token_chars={value}").parse::<typmod::Property>() {
+                parsed.add_property(property);
+            }
+            continue;
+        }
         let trimmed = part.trim();
         if !trimmed.is_empty()
             && let Ok(prop) = trimmed.parse::<typmod::Property>()
         {
             parsed.add_property(prop);
         }
+        index += 1;
     }
     parsed
 }
@@ -803,5 +825,37 @@ unsafe fn convert_varlena_to_str_memoized<'a>(varlena: *const pg_sys::varlena) -
                 )
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tokenizer_expression_tests {
+    use super::tokenizer_from_expression;
+    use tantivy::tokenizer::TokenStream;
+
+    fn tokenize(expression: &str, text: &str) -> Vec<String> {
+        let mut analyzer = tokenizer_from_expression(expression)
+            .unwrap()
+            .to_tantivy_tokenizer()
+            .unwrap();
+        let mut stream = analyzer.token_stream(text);
+        let mut tokens = Vec::new();
+        while stream.advance() {
+            tokens.push(stream.token().text.clone());
+        }
+        tokens
+    }
+
+    #[test]
+    fn edge_ngram_expression_defaults_to_letters_and_digits() {
+        assert_eq!(tokenize("edge_ngram(1,2)", "ab-12"), ["a", "ab", "1", "12"]);
+    }
+
+    #[test]
+    fn edge_ngram_expression_preserves_multiple_token_char_classes() {
+        assert_eq!(
+            tokenize("edge_ngram(1,2,token_chars=letter,PUNCTUATION)", "a-b"),
+            ["a", "a-"]
+        );
     }
 }
